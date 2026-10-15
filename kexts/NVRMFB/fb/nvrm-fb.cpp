@@ -322,6 +322,10 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     NvBool submitConfig(struct NvKmsKapiRequestedModeSetConfig *cfg, struct NvKmsKapiModeSetReplyConfig *rep, NvBool commit,
                         bool bootstrap = false, bool cursorOnly = false);
     thread_call_t fReflip = nullptr;
+    // Cursor moves that found the display gate busy (a primary flip waiting for its latch): the newest position is
+    // committed from this thread call instead of blocking the caller. See setCursorState.
+    thread_call_t fCurCall = nullptr; volatile UInt32 fCurDeferred = 0; unsigned fCurDeferrals = 0;
+    static void cursorFire(thread_call_param_t p0, thread_call_param_t);
     unsigned fReflips = 0; int fReflipRc = -99;
     unsigned fVblReg = 0;
     unsigned long long fVblCalls = 0;
@@ -1652,13 +1656,41 @@ IOReturn NVRMNVDAFramebuffer::setCursorImage(void *cursorImage)
     if (!cursorApply()) { fCurHaveImage = false; cursorApply(); return kIOReturnUnsupported; }
     return kIOReturnSuccess;
 }
+// A cursor move must not wait for a primary flip. The pure flip holds the display gate until its surface latches (up
+// to a whole refresh), and WindowServer moves the cursor while holding CoreDisplay's display-manager mutex, which its
+// main thread needs for every window move and display update, so a window drag stalled behind every flip in flight on
+// either head. When the gate is busy, the position is recorded and committed from fCurCall once the gate is free. The
+// hardware cursor only latches at vblank, so nothing visible is delayed. Shape changes (setCursorImage) still commit
+// synchronously.
 IOReturn NVRMNVDAFramebuffer::setCursorState(SInt32 x, SInt32 y, bool visible)
 {
     if (!fCurSurf) return kIOReturnUnsupported;
     if (x == fCurX && y == fCurY && visible == fCurVisible && fCurRc == NV_KMS_FLIP_RESULT_SUCCESS)
         return kIOReturnSuccess;
     fCurX = x; fCurY = y; fCurVisible = visible;
-    return cursorApply() ? kIOReturnSuccess : kIOReturnError;
+    IORecursiveLock *gl = startLock();
+    bool locked = false;
+    if (fCurCall && gl) {
+        if (!IORecursiveLockTryLock(gl)) {
+            if (OSCompareAndSwap(0, 1, &fCurDeferred)) scheduleCall(fCurCall, 0);
+            if (++fCurDeferrals <= 4 || (fCurDeferrals % 4096) == 0)
+                FBLOG("cursor move %u deferred: display gate busy (a flip is waiting for its latch)", fCurDeferrals);
+            return kIOReturnSuccess;
+        }
+        locked = true;
+    }
+    const bool ok = cursorApply();
+    if (locked) IORecursiveLockUnlock(gl);
+    return ok ? kIOReturnSuccess : kIOReturnError;
+}
+void NVRMNVDAFramebuffer::cursorFire(thread_call_param_t p0, thread_call_param_t)
+{
+    NVRMNVDAFramebuffer *me = (NVRMNVDAFramebuffer *)p0;
+    NVRMCallReference callReference(me);
+    if (OSAddAtomic(0, &me->fStopping)) return;
+    // Cleared before the position is read: a move after this point queues another commit with the newer position.
+    OSCompareAndSwap(1, 0, &me->fCurDeferred);
+    (void)me->cursorApply();   // waits for the gate here, on a kernel thread
 }
 void NVRMNVDAFramebuffer::barsFire(thread_call_param_t p0, thread_call_param_t)
 {
@@ -1934,6 +1966,7 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     FBLOG("hw vblank on head %u: %s", fHead, !hwvblArg ? "OFF (boot-arg nvhwvbl=0) - the timer is the VBL"
                                        : fHwVblWanted ? "deferred until NVKMS latches a flip on this head" : "not available - the timer stays the VBL");
     fReflip = thread_call_allocate(reflipFire, this);
+    fCurCall = thread_call_allocate(cursorFire, this);
     FBLOG("reflip keep-alive NOT armed: enableController's modeset owns the head, no boot-time re-syncs");
     fBars = thread_call_allocate(barsFire, this);
     uint32_t hudGate = 0;
@@ -1988,7 +2021,7 @@ void NVRMNVDAFramebuffer::stop(IOService *provider)
         if (sl) IORecursiveLockUnlock(sl);
         if (mine) release();
     }
-    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fLogoWatch};
+    thread_call_t *calls[] = {&fHwVblCall, &fReflip, &fBars, &fVblTimer, &fSampler, &fHeadProbe, &fLogoWatch, &fCurCall};
     for (unsigned i = 0; i < sizeof calls / sizeof calls[0]; ++i) {
         thread_call_t call = *calls[i];
         if (!call) continue;
