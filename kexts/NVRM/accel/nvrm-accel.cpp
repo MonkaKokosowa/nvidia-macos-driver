@@ -941,6 +941,26 @@ bool NVDisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *)
 static void nvAccelSurfScanoutSync(IOSurface *s);
 static bool nvAccelSurfCopyReady(IOSurface *s, unsigned head);
 static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe);
+// IOSurfaces the display pipe was recently asked to show (any head, flipped or copied). WindowServer's Metal plugin reads
+// them (debug.nvaccel_swap_ids) so that it waits for GPU completion only before a surface that goes to a display; a
+// render target that only feeds another GPU pass (CoreDisplay's display-pipe pass reads the composite) is ordered by
+// the queue instead. Deduplicated; 32 slots, far more than the 3-4 buffers per display WindowServer cycles through.
+enum { kNvSwapIds = 32 };
+static volatile UInt32 gIopSwapIds[kNvSwapIds];
+static volatile SInt32 gIopSwapIdNext;
+static void nvAccelNoteSwapSurface(unsigned id)
+{
+    if (!id) return;
+    for (unsigned i = 0; i < kNvSwapIds; i++) if (gIopSwapIds[i] == id) return;
+    const unsigned slot = (unsigned)OSIncrementAtomic(&gIopSwapIdNext) % kNvSwapIds;
+    gIopSwapIds[slot] = id;
+}
+static int nvaccel_swap_ids_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
+{
+    UInt32 ids[kNvSwapIds];
+    for (unsigned i = 0; i < kNvSwapIds; i++) ids[i] = gIopSwapIds[i];
+    return SYSCTL_OUT(req, ids, sizeof ids);
+}
 static void nvAccelIopHome(IOService *fb, unsigned head);
 IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 {
@@ -953,6 +973,7 @@ IOReturn NVDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *txn)
 
     IOSurface *s  = txn->getPlaneIOSurface(0, 0);
     OSObject  *ro = txn->getPlaneResource(0, 0);
+    if (s) nvAccelNoteSwapSurface(s->getSurfaceID());
     if (!s && !ro) { OSAddAtomic64(1, &gCntIopEmpty); return kIOReturnSuccess; }
 
     const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false;
@@ -1131,6 +1152,8 @@ NVACCEL_CNT(nvaccel_iop_async_drop,    gCntIopAsyncDrop,    "frames dropped beca
 static int gCrcHead = 0;
 SYSCTL_INT(_debug, OID_AUTO, nvaccel_crc_head, CTLFLAG_RW | CTLFLAG_LOCKED, &gCrcHead, 0, "b85k-crc: which head debug.nvaccel_crc reads");
 static int nvaccel_crc_sysctl SYSCTL_HANDLER_ARGS;
+SYSCTL_PROC(_debug, OID_AUTO, nvaccel_swap_ids, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_swap_ids_sysctl, "IU",
+            "IOSurface IDs the display pipe was recently asked to show (32 x UInt32, 0 = empty)");
 SYSCTL_PROC(_debug, OID_AUTO, nvaccel_crc, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, nvaccel_crc_sysctl, "I",
             "b85k-crc: display CRC32 of what head nvaccel_crc_head is showing (0 = unavailable)");
 static bool gSysctlInstalled = false;
@@ -1171,6 +1194,7 @@ static void nvaccelInstallSysctl(void)
     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok_h4);      sysctl_register_oid(&sysctl__debug_nvaccel_igpu);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_published); sysctl_register_oid(&sysctl__debug_nvaccel_heads_registered);
     sysctl_register_oid(&sysctl__debug_nvaccel_heads_piped);
+    sysctl_register_oid(&sysctl__debug_nvaccel_swap_ids);
     gSysctlInstalled = true;
     ALOG("sysctl debug.nvaccelfb installed -- `sudo sysctl -w debug.nvaccelfb=1` registers the framebuffer");
 #endif

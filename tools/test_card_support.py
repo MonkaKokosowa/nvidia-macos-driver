@@ -95,11 +95,14 @@ static const char *fixture_program(void) { return program; }
 @interface Command : NSObject
 @property int status;
 @property int completed, scheduled, commits;
+@property BOOL scanout;
 - (void)commit;
 - (void)waitUntilCompleted;
 - (void)waitUntilScheduled;
 - (BOOL)commitAndWaitUntilSubmitted;
 @end
+static int must_calls;
+static BOOL nvmtl_ws_must_complete(Command *cb) { must_calls++; return cb.scanout; }
 @implementation Command
 - (void)commit { self.commits++; }
 - (void)waitUntilCompleted { self.completed++; }
@@ -109,9 +112,12 @@ PRODUCTION
 int main(int argc,char **argv) { @autoreleasepool {
  program=argc>1?argv[1]:NULL;
  BOOL ws=program && !strcmp(program,"WindowServer");
- Command *cb=[Command new];
+ Command *cb=[Command new]; cb.scanout=YES;
  if (![cb commitAndWaitUntilSubmitted] || cb.commits!=1 ||
      cb.completed!=(ws?1:0) || cb.scheduled!=(ws?0:1)) return 42;
+ Command *composite=[Command new]; composite.scanout=NO;
+ if (![composite commitAndWaitUntilSubmitted] || composite.completed!=0 || composite.scheduled!=1) return 44;
+ if (!ws && must_calls) return 45;
  cb.status=MTLCommandBufferStatusError;
  if ([cb commitAndWaitUntilSubmitted]) return 43;
  puts("PASS display completion ordering and error return");

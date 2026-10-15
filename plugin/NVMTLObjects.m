@@ -4795,15 +4795,73 @@ destinationBytesPerImage:(NSUInteger)img options:(MTLBlitOption)opt {
 - (void)popDebugGroup {}
 - (void)encodeSignalEvent:(id<MTLEvent>)e value:(uint64_t)v { [self nvmtlRecordSignal:e value:v]; }
 - (void)encodeWaitForEvent:(id<MTLEvent>)e value:(uint64_t)v { [self nvmtlRecordWait:e value:v]; }
-// The display-pipe swap follows this call immediately in WindowServer. NVAccel
-// cannot order that swap after an NVK fence, so wait for the pixels to finish
-// before allowing the surface to become scanout. Other applications keep the
-// normal submission-only contract.
+// The display-pipe swap follows this call immediately in WindowServer. NVAccel cannot order that swap after an NVK
+// fence, so a buffer that writes a surface which becomes scanout waits for its pixels to finish. Other buffers don't:
+// SkyLight calls this after every composite and CoreDisplay again after its display-pipe pass, which reads the
+// composite on the GPU and writes the surface that is shown. The composite's reader is ordered by the queue (one
+// VkQueue, and every render pass carries full external dependencies), the same order nvmtl_surface_in_for_cb relies
+// on. So the wait stays for a buffer that writes a surface NVAccel has been asked to show (debug.nvaccel_swap_ids), a
+// surface seen fewer than 4 times, no IOSurface at all, or when the kernel publishes no list. Other applications keep
+// the normal submission-only contract. NVMTL_WS_WAIT_ALL=1 (nvrm610.conf) restores the wait after every buffer.
+static int nvmtl_ws_scanout_only(void)
+{
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("NVMTL_WS_WAIT_ALL"); on = !(e && e[0] == '1');
+        nvlog("ws: completion wait %s (NVMTL_WS_WAIT_ALL=%s)", on ? "only for buffers that write a displayed surface" : "after every buffer (old)", e ? e : "unset"); }
+    return on;
+}
+enum { NVMTL_WS_SURF = 64, NVMTL_WS_WARM = 4 };
+static struct { uint32_t id, writes; } g_ws_surf[NVMTL_WS_SURF];
+static unsigned g_ws_surf_next;
+static _Atomic unsigned long long g_ws_waits, g_ws_skips;
+static uint32_t nvmtl_ws_note_write(uint32_t id)
+{
+    for (unsigned i = 0; i < NVMTL_WS_SURF; i++)
+        if (g_ws_surf[i].id == id) { if (g_ws_surf[i].writes < 0xffffffffu) g_ws_surf[i].writes++; return g_ws_surf[i].writes; }
+    const unsigned slot = g_ws_surf_next++ % NVMTL_WS_SURF;
+    g_ws_surf[slot].id = id; g_ws_surf[slot].writes = 1;
+    return 1;
+}
+static BOOL nvmtl_ws_must_complete(NVMTLCommandBuffer *cb)
+{
+    if (!nvmtl_ws_scanout_only()) return YES;
+    uint32_t ids[16]; unsigned n = 0; BOOL many = NO;
+    @synchronized ([NVMTLCommandBuffer class]) {
+        NSMutableArray *all = [NSMutableArray new];
+        if (cb->_surfDirty) [all addObjectsFromArray:cb->_surfDirty.allObjects];
+        for (NVMTLSubmissionPart *part in cb->_parts) if (part->surfaces) [all addObjectsFromArray:[part->surfaces allObjects]];
+        for (NVMTLTexture *t in all) {
+            NVMTLTexture *r = t->_parent ? t->_parent : t;
+            if (!r->_surf) continue;
+            const uint32_t id = (uint32_t)IOSurfaceGetID(r->_surf);
+            BOOL seen = NO; for (unsigned i = 0; i < n; i++) if (ids[i] == id) seen = YES;
+            if (seen) continue;
+            if (n == 16) { many = YES; break; }
+            ids[n++] = id;
+        }
+    }
+    BOOL must = !n || many;
+    uint32_t swap[32] = {0}; size_t len = sizeof swap;
+    if (!must && (sysctlbyname("debug.nvaccel_swap_ids", swap, &len, NULL, 0) || len != sizeof swap)) must = YES;
+    @synchronized ([NVMTLCommandBuffer class]) {
+        for (unsigned i = 0; i < n; i++) {
+            if (nvmtl_ws_note_write(ids[i]) < NVMTL_WS_WARM) must = YES;
+            for (unsigned k = 0; k < 32; k++) if (swap[k] == ids[i]) must = YES;
+        }
+    }
+    const unsigned long long k = must ? ++g_ws_waits : ++g_ws_skips;
+    if (k <= 4 || (k % 4096) == 0)
+        nvlog("ws: %s after a buffer writing %u surface(s) (first %u) - %llu waited, %llu returned when scheduled",
+              must ? "completion wait" : "no completion wait", n, n ? ids[0] : 0u,
+              (unsigned long long)g_ws_waits, (unsigned long long)g_ws_skips);
+    return must;
+}
 - (BOOL)commitAndWaitUntilSubmitted {
     static int ws = -1;
     if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
+    const BOOL complete = ws && nvmtl_ws_must_complete(self);
     [self commit];
-    if (ws) [self waitUntilCompleted]; else [self waitUntilScheduled];
+    if (complete) [self waitUntilCompleted]; else [self waitUntilScheduled];
     return self.status != MTLCommandBufferStatusError;
 }
 - (void)commit { [self nvmtlSubmitWithEvents]; }
