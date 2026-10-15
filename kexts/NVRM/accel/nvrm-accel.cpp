@@ -1319,6 +1319,7 @@ static unsigned gNVSVOk, gNVSVRefused;
 static inline void nvSVZero(void *p, unsigned long n) { volatile unsigned char *b = (volatile unsigned char *)p; while (n--) *b++ = 0; }
 
 static unsigned gNVSVDirty, gNVSVDirtyRefused, gNVSVPageoff, gNVSVPageoffFail;
+static unsigned gNVSVRewired, gNVSVRewireMiss;
 static unsigned nvAccelSurfDirty(void *cache, NVResource *res, unsigned plane)
 {
     volatile unsigned char *r = (volatile unsigned char *)res;
@@ -1353,7 +1354,25 @@ static IOReturn nvAccelSurfVram(struct NVRMSurfShareEsc *p, task_t task, unsigne
     NVResource *res = OSDynamicCast(NVResource, ctx);
     NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
     if (cmd == NVRM_ESC_SURF_DIRTY) {
-        p->status = (cache && res && vm && vm->fRmHandle) ? nvAccelSurfDirty(cache, res, p->plane) : NVRM_SS_NO_CACHE;
+        // The family parks a surface's VRAM when it copies the surface back for the CPU (NVVidMemory::deallocPhysical)
+        // and only takes it back when the family itself needs the surface on the GPU. The Metal plugin keeps drawing
+        // into that parked VRAM through its own import, so the family never does: from then on every dirty mark was
+        // refused (no RM handle) and the plugin read the whole surface back after each draw. With two displays this
+        // hits a WindowServer display surface on every frame. Wire it back here, as the SURF_VRAM path below does, but
+        // only when wiring hands back the parked VRAM, the memory the plugin drew into; otherwise keep refusing.
+        bool stale = false;
+        if (vm && !vm->fRmHandle && !vm->fScanout && vm->fParkHandle &&
+            vm->fParkBytes >= *(const volatile unsigned long long *)((const unsigned char *)vm + 0x40)) {
+            void *const parked = vm->fParkHandle;
+            _ZN16IOAccelVidMemory4wireEv(vm);
+            if (vm->fRmHandle == parked) gNVSVRewired++;
+            else { stale = vm->fRmHandle != nullptr; gNVSVRewireMiss++; }
+            if (gNVSVRewired + gNVSVRewireMiss <= 8 || ((gNVSVRewired + gNVSVRewireMiss) & 1023) == 0)
+                ALOG("surfvram dirty: surface %u: parked VRAM wired back %s (rewired %u, missed %u)", p->surfaceID,
+                     vm->fRmHandle == parked ? "-- the plugin's memory" : stale ? "as NEW memory, mark refused" : "FAILED",
+                     gNVSVRewired, gNVSVRewireMiss);
+        }
+        p->status = (cache && res && vm && vm->fRmHandle && !stale) ? nvAccelSurfDirty(cache, res, p->plane) : NVRM_SS_NO_CACHE;
         if (p->status == 0) gNVSVDirty++; else gNVSVDirtyRefused++;
         if (gNVSVDirty + gNVSVDirtyRefused <= 6 || ((gNVSVDirty + gNVSVDirtyRefused) & 4095) == 0)
             ALOG("surfvram dirty: surface %u plane %u type 0x%x -> %#x (dirty %u, refused %u)", p->surfaceID, p->plane,
